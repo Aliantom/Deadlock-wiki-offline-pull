@@ -1,0 +1,10 @@
+# Mirror output - downloaded from the release, not stored in git
+# (server.py lives here too; keep it tracked as an exception)
+deadlock_mirror/*
+!deadlock_mirror/server.py
+
+*.tar.part*
+*.log
+.DS_Store
+__pycache__/
+*.pyc

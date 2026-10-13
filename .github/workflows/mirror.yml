@@ -1,0 +1,69 @@
+name: Mirror deadlock.wiki
+
+# deadlock.wiki's Cloudflare bot check currently blocks GitHub's servers, so
+# the mirror normally runs on your own machine (see the readme). This
+# workflow checks once a day whether GitHub can get through (e.g. if the
+# wiki's admins allow this mirror). If it can, it updates the mirror and
+# uploads it to the "mirror-data" release itself; if not, it stops after
+# the check, which takes under a minute.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: Stop starting new pages after this many minutes
+        default: '300'
+
+permissions:
+  contents: write   # upload the mirror to the release
+
+concurrency:
+  group: deadlock-mirror
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  MIRROR_REPO: ${{ github.repository }}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Can GitHub reach the wiki?
+        id: check
+        run: |
+          if python deadlock_mirror.py --check; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Mirror::deadlock.wiki still blocks GitHub's servers; run the mirror at home (see readme)."
+          fi
+
+      - name: Restore the mirror from the release
+        if: steps.check.outputs.ok == 'true'
+        run: |
+          mkdir -p /tmp/parts
+          if gh release download mirror-data --pattern "mirror-deadlock.tar.part*" --dir /tmp/parts 2>/dev/null; then
+            cat /tmp/parts/mirror-deadlock.tar.part* | tar -x -C ~ && du -sh ~/deadlock_mirror
+          else
+            echo "No saved mirror yet; starting fresh."
+          fi
+          rm -rf /tmp/parts
+
+      - name: Update and publish
+        if: steps.check.outputs.ok == 'true'
+        env:
+          BUDGET: ${{ inputs.budget_minutes || '300' }}
+        run: |
+          pip install -U yt-dlp
+          python deadlock_mirror.py --budget-minutes "$BUDGET" --publish
+          cat ~/deadlock_mirror/status.md >> "$GITHUB_STEP_SUMMARY"

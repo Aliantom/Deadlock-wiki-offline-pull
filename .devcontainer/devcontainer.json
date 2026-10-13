@@ -1,0 +1,12 @@
+{
+    "name": "Deadlock Wiki Mirror",
+    "postStartCommand": "bash .devcontainer/start.sh",
+    "postAttachCommand": "bash .devcontainer/start.sh --no-refresh",
+    "forwardPorts": [8000],
+    "portsAttributes": {
+        "8000": {
+            "label": "Deadlock Wiki Mirror",
+            "onAutoForward": "openBrowser"
+        }
+    }
+}
