@@ -1,0 +1,43 @@
+name: Probe wiki
+
+# Saves raw samples of the live wiki to the "probe" branch so the mirror
+# can be built against real markup. Safe to delete.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: Space-separated page paths to save
+        default: "Main_Page Abrams Items Haze Update:Main_Page"
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch samples
+        env:
+          PAGES: ${{ inputs.pages }}
+        run: |
+          mkdir -p /tmp/probe && cd /tmp/probe
+          UA="DeadlockOfflineMirror/1.0 (personal offline reader)"
+          get() { curl -sS -L -A "$UA" --max-time 60 -o "$2" -w "%{http_code} %{size_download} $1\n" "$1" >> codes.txt; sleep 1; }
+          get "https://deadlock.wiki/" root.html
+          for p in $PAGES; do get "https://deadlock.wiki/$p" "page-$(echo "$p" | tr '/:' '__').html"; done
+          A="https://deadlock.wiki/api.php?format=json&action=query"
+          get "$A&meta=siteinfo&siprop=general|languages|extensions|skins|rightsinfo" siteinfo.json
+          for ns in 0 3000 14 12 4; do
+            get "$A&list=allpages&apnamespace=$ns&aplimit=500&apfilterredir=nonredirects" "allpages-$ns.json"
+          done
+          get "$A&list=allpages&apnamespace=0&aplimit=500&apfilterredir=nonredirects&apfrom=M" allpages-0-M.json
+          get "https://deadlock.wiki/robots.txt" robots.txt
+          cat codes.txt
+      - name: Commit to probe branch
+        run: |
+          cd /tmp/probe
+          git init -q -b probe && git add -A
+          git -c user.name=probe -c user.email=probe@local commit -qm "probe $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" probe
