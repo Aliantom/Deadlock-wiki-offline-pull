@@ -68,6 +68,10 @@ from typing import Dict, List, Optional, Set, Tuple
 # Override with DEADLOCK_BASE for local testing against a fake wiki.
 BASE = os.environ.get("DEADLOCK_BASE", "https://deadlock.wiki").rstrip("/")
 HOSTS = {"deadlock.wiki", "www.deadlock.wiki", urllib.parse.urlsplit(BASE).netloc}
+# Web fonts the wiki's stylesheets load from elsewhere; saved under /_ext/.
+EXTERNAL_FONT_HOSTS = {"fonts.googleapis.com", "fonts.gstatic.com"}
+# Bump when stylesheet rewriting changes, so saved stylesheets are redone.
+CSS_VERSION = 2
 API = f"{BASE}/api.php"
 
 # Namespaces to mirror: 0 = articles, 3000 = Update (patch notes),
@@ -237,6 +241,9 @@ def load_state() -> dict:
     state.setdefault("css", {})        # load.php query -> iso fetched
     state.setdefault("yt_failed", {})  # youtube id -> {"when": iso, "why": str}
     state.setdefault("gone", {})       # local asset path -> iso of last 404
+    if state.get("css_version") != CSS_VERSION:
+        state["css"] = {}                # re-download and re-rewrite stylesheets
+        state["css_version"] = CSS_VERSION
     return state
 
 
@@ -476,11 +483,58 @@ class Mirror:
         self.stats["css"] += 1
         return local
 
+    def ensure_external(self, url: str) -> Optional[str]:
+        """Web fonts from Google Fonts: save them under /_ext/ so the font
+        looks right even where Google is unreachable."""
+        parts = urllib.parse.urlsplit(url)
+        if parts.netloc == "fonts.googleapis.com":
+            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+            local = f"/_ext/fonts/{digest}.css"
+            if local in self.done_assets:
+                return local
+            self.done_assets.add(local)
+            dest = local_file(local)
+            if dest.exists():
+                return local
+            status, body = self.fetcher.get(url)
+            if status != 200:
+                self.stats["failed"] += 1
+                return None
+            css = CSS_URL_RE.sub(
+                lambda m: "url(%s)" % (self.ensure_external(
+                    urllib.parse.urljoin(url, html.unescape(m.group(2)))) or m.group(2)),
+                body.decode("utf-8", errors="replace"))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(css, encoding="utf-8")
+            self.stats["css"] += 1
+            return local
+        if parts.netloc == "fonts.gstatic.com":
+            local = f"/_ext/{parts.netloc}{parts.path}"
+            if local in self.done_assets:
+                return local
+            self.done_assets.add(local)
+            dest = local_file(local)
+            if not dest.exists():
+                status, body = self.fetcher.get(url)
+                if status != 200:
+                    self.stats["failed"] += 1
+                    return None
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(body)
+                self.stats["assets"] += 1
+            return local
+        return None
+
     def rewrite_css(self, css: str, base_url: str) -> str:
         def fix_url(m):
             quote, target = m.group(1), m.group(2)
             path = to_site_path(target, base_url)
             if path is None:
+                full = urllib.parse.urljoin(base_url, html.unescape(target.strip()))
+                if urllib.parse.urlsplit(full).netloc in EXTERNAL_FONT_HOSTS:
+                    local = self.ensure_external(full)
+                    if local:
+                        return f"url({quote}{local}{quote})"
                 return m.group(0)
             if is_stylesheet_url(path):
                 return f"url({quote}{self.ensure_stylesheet(path)}{quote})"
@@ -489,7 +543,10 @@ class Mirror:
         def fix_import(m):
             path = to_site_path(m.group(2), base_url)
             if path is None:
-                return m.group(0)
+                full = urllib.parse.urljoin(base_url, html.unescape(m.group(2).strip()))
+                local = (self.ensure_external(full)
+                         if urllib.parse.urlsplit(full).netloc in EXTERNAL_FONT_HOSTS else None)
+                return f'@import "{local}"' if local else m.group(0)
             return f'@import "{self.ensure_stylesheet(path)}"'
 
         css = CSS_IMPORT_RE.sub(fix_import, css)

@@ -196,11 +196,30 @@ MIRROR_JS = r"""<script id="mirror-js">
       });
     });
   }
+  // ---- Countdowns (Template:Timer: data-targets="iso,iso,...") ---------
+  function setupTimer(el) {
+    var targets = (el.getAttribute("data-targets") || el.getAttribute("data-target") || "")
+      .split(",").map(function (s) { return Date.parse(s.trim()); })
+      .filter(function (t) { return !isNaN(t); }).sort();
+    function pad(n) { return (n < 10 ? "0" : "") + n; }
+    function tick() {
+      var now = Date.now(), next = null;
+      for (var i = 0; i < targets.length; i++) if (targets[i] > now) { next = targets[i]; break; }
+      if (next === null) { el.textContent = "Now"; return; }
+      var s = Math.floor((next - now) / 1000), d = Math.floor(s / 86400);
+      s -= d * 86400;
+      var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      el.textContent = (d ? d + "d " : "") + pad(h) + ":" + pad(m) + ":" + pad(sec);
+    }
+    tick();
+    setInterval(tick, 1000);
+  }
   function run(fn, list) { Array.prototype.forEach.call(list, function (x) { try { fn(x); } catch (e) {} }); }
   function init() {
     run(setupTabber, document.querySelectorAll(".tabber"));
     run(setupCollapsible, document.querySelectorAll(".mw-collapsible"));
     run(setupSortable, document.querySelectorAll("table.sortable"));
+    run(setupTimer, document.querySelectorAll(".template-timer"));
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
   else init();
