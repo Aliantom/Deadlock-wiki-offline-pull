@@ -942,6 +942,14 @@ def main() -> int:
                         help="Upload what's on disk without downloading anything.")
     args = parser.parse_args()
 
+    # Windows consoles default to a legacy code page; don't let a page title
+    # with an unusual character crash the run when it's printed.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     if args.check:
         return check_access()
 
