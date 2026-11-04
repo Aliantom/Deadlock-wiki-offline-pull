@@ -58,6 +58,17 @@ daily runs only fetch what changed and take minutes.
 - Arguments: `deadlock_mirror.py --publish`
 - Start in: the folder you cloned into
 
+**Linux (systemd user timer, what the home Ubuntu PC uses):** put
+`deadlock-mirror.service` and `deadlock-mirror.timer` in
+`~/.config/systemd/user/` (copies are in `Aliantom/workstation-config`,
+`systemd-user/`), then `systemctl --user daemon-reload && systemctl --user
+enable --now deadlock-mirror.timer`. It runs at 04:00 ET, updates yt-dlp
+first, and logs to `journalctl --user -u deadlock-mirror`. Run one now with
+`systemctl --user start deadlock-mirror`.
+
+Only one machine should run the daily job: each upload replaces the last,
+so two machines would overwrite each other's copy.
+
 **Linux / macOS (cron):** `crontab -e`, then:
 
 ```

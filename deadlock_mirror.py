@@ -113,6 +113,9 @@ MISSING_RETRY_AFTER = timedelta(days=7)
 YOUTUBE_MAX_HEIGHT = int(os.environ.get("DEADLOCK_YT_HEIGHT", "360"))
 YOUTUBE_DIR_NAME = "_media/yt"
 YOUTUBE_RETRY_AFTER = timedelta(days=2)
+YOUTUBE_MAX_SIZE = "80M"
+# Videos over the size limit (long streams) are only re-checked monthly.
+YOUTUBE_TOO_BIG_RETRY = timedelta(days=30)
 # Keep in sync with server.py.
 YOUTUBE_ID_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:embed/|watch\?v=|shorts/|v/)|youtu\.be/|ytimg\.com/vi/)"
@@ -333,21 +336,30 @@ def discover_pages(fetcher: Fetcher, scope: Scope) -> Dict[str, Optional[int]]:
     """Return {title: latest revision id} for every page to mirror, and fill
     scope.redirects. Returns {} if the API can't be reached; pages are then
     discovered by following links."""
+    # Cloudflare challenges any API request with a "filterredir" parameter
+    # (seen 2026-11-04), so list every page and sort out redirects here; their
+    # targets come from list=allredirects, matched by the redirect's page id.
     found: Dict[str, Optional[int]] = {}
+    redirect_ids: Dict[int, str] = {}
     try:
         for ns in NAMESPACES:
             for data in api_all(fetcher, {
                     "generator": "allpages", "gapnamespace": str(ns), "gaplimit": "500",
-                    "gapfilterredir": "nonredirects", "prop": "info"}):
+                    "prop": "info"}):
                 for page in data.get("query", {}).get("pages", {}).values():
-                    if not scope.is_translation(page["title"]):
+                    if "redirect" in page:
+                        redirect_ids[page["pageid"]] = page["title"]
+                    elif not scope.is_translation(page["title"]):
                         found[page["title"]] = page.get("lastrevid")
+        for ns in NAMESPACES:   # namespace of the redirect *target*
             for data in api_all(fetcher, {
-                    "generator": "allpages", "gapnamespace": str(ns), "gaplimit": "500",
-                    "gapfilterredir": "redirects", "redirects": "1"}):
-                for r in data.get("query", {}).get("redirects", []):
-                    target = r["to"] + (f"#{r['tofragment']}" if r.get("tofragment") else "")
-                    scope.redirects[r["from"]] = target
+                    "list": "allredirects", "arnamespace": str(ns), "arlimit": "500",
+                    "arprop": "ids|title|fragment"}):
+                for r in data.get("query", {}).get("allredirects", []):
+                    source = redirect_ids.get(r.get("fromid"))
+                    if source:
+                        scope.redirects[source] = r["title"] + (
+                            f"#{r['fragment']}" if r.get("fragment") else "")
     except IOError:
         logging.warning("Page-list API unreachable; discovering pages from links only.")
         return {}
@@ -735,16 +747,21 @@ def plan(state: dict, discovered: Dict[str, Optional[int]], scope: Scope,
     return todo + missing_first + repair + changed
 
 
-def prune_deleted(discovered: Dict[str, Optional[int]], state: dict) -> int:
+def prune_deleted(discovered: Dict[str, Optional[int]], state: dict,
+                  redirects: Dict[str, str]) -> int:
     """Remove pages that were deleted or turned into redirects on the wiki."""
     if not discovered:
         return 0
     removed = 0
     for title in page_titles_on_disk():
         # Only pages the API listed before; pages found by following links
-        # (revid None) aren't in the API listing to begin with.
+        # (revid None) aren't in the API listing to begin with. Known
+        # redirects always go: a saved copy would shadow the redirect (the
+        # server serves files first) and never be updated.
         saved = state["pages"].get(title) or {}
-        if title not in discovered and title not in PRIORITY_TITLES and saved.get("revid"):
+        if title in PRIORITY_TITLES or title in discovered:
+            continue
+        if saved.get("revid") or title in redirects:
             title_to_path(title).unlink(missing_ok=True)
             state["pages"].pop(title, None)
             removed += 1
@@ -769,14 +786,15 @@ def youtube_file(vid: str) -> Path:
 def download_youtube(state: dict, deadline: Optional[datetime]) -> dict:
     """Download YouTube videos embedded in pages with yt-dlp."""
     ids = youtube_ids()
-    result = {"total": len(ids), "downloaded": 0, "failed_now": 0, "remaining": 0,
-              "skipped": None}
+    result = {"total": len(ids), "downloaded": 0, "failed_now": 0, "too_big": 0,
+              "remaining": 0, "skipped": None}
     todo = []
     for vid in ids:
         if youtube_file(vid).exists():
             continue
         failed = state["yt_failed"].get(vid)
-        if failed and now() - datetime.fromisoformat(failed["when"]) < YOUTUBE_RETRY_AFTER:
+        wait = YOUTUBE_TOO_BIG_RETRY if failed and failed.get("too_big") else YOUTUBE_RETRY_AFTER
+        if failed and now() - datetime.fromisoformat(failed["when"]) < wait:
             continue
         todo.append(vid)
     result["remaining"] = len(todo)
@@ -796,13 +814,18 @@ def download_youtube(state: dict, deadline: Optional[datetime]) -> dict:
             break
         out = youtube_file(vid)
         cmd = [ytdlp, "-q", "--no-warnings", "--no-playlist", "-f", fmt,
-               "--merge-output-format", "mp4", "--max-filesize", "80M",
+               "--merge-output-format", "mp4", "--max-filesize", YOUTUBE_MAX_SIZE,
                "--sleep-requests", "1", "-o", str(out.with_suffix(".%(ext)s")),
                f"https://www.youtube.com/watch?v={vid}"]
+        too_big = False
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             ok = proc.returncode == 0 and out.exists()
-            why = (proc.stderr.strip().splitlines() or ["unknown error"])[-1][:200]
+            # yt-dlp exits 0 without a file when --max-filesize skips it
+            # (usually hours-long streams).
+            too_big = proc.returncode == 0 and not out.exists()
+            why = (f"over the {YOUTUBE_MAX_SIZE}B size limit" if too_big else
+                   (proc.stderr.strip().splitlines() or ["unknown error"])[-1][:200])
         except subprocess.TimeoutExpired:
             ok, why = False, "timed out"
         if ok:
@@ -810,6 +833,13 @@ def download_youtube(state: dict, deadline: Optional[datetime]) -> dict:
             state["yt_failed"].pop(vid, None)
             streak = 0
             logging.info("Video %s saved (%s)", vid, ids[vid][0])
+        elif too_big:
+            for leftover in out.parent.glob(f"{vid}.*"):   # the aborted .part file
+                if leftover != out:
+                    leftover.unlink(missing_ok=True)
+            result["too_big"] += 1
+            state["yt_failed"][vid] = {"when": now().isoformat(), "why": why, "too_big": True}
+            logging.info("Video %s skipped: %s", vid, why)
         else:
             result["failed_now"] += 1
             state["yt_failed"][vid] = {"when": now().isoformat(), "why": why}
@@ -845,6 +875,8 @@ def write_status(state: dict, discovered: Dict[str, Optional[int]], remaining: L
         have = sum(1 for v in youtube_ids() if youtube_file(v).exists())
         lines.append(f"- YouTube videos: **{have} / {videos['total']}** downloaded; "
                      f"this run +{videos['downloaded']}, {videos['failed_now']} failed"
+                     + (f", {videos['too_big']} skipped as too large"
+                        if videos.get("too_big") else "")
                      + (f" ({videos['skipped']})" if videos.get("skipped") else ""))
     lines += [
         f"- This run: {stats['pages']} pages, {stats['assets']} images/fonts/videos, "
@@ -965,7 +997,11 @@ def check_access() -> int:
     """Quick test: can this machine reach the wiki past Cloudflare?"""
     fetcher = Fetcher(0.5)
     ok = True
+    # The page list is checked too: Cloudflare can pass simple API calls while
+    # challenging the listing, and without it changed pages never update.
     for label, url in (("API", f"{API}?action=query&meta=siteinfo&format=json"),
+                       ("List", f"{API}?action=query&format=json&generator=allpages"
+                                "&gapnamespace=0&gaplimit=5&prop=info"),
                        ("Page", title_to_url(MAIN_TITLE))):
         try:
             status, body = fetcher.get(url)
@@ -1038,7 +1074,7 @@ def main() -> int:
             discovered = discover_pages(fetcher, scope)
             if scope.redirects:
                 save_redirects(scope)
-            prune_deleted(discovered, state)
+            prune_deleted(discovered, state, scope.redirects)
             queue = plan(state, discovered, scope, args.refetch_all, set(audit(state)["broken"]))
         logging.info("%d pages to fetch this run", len(queue))
         seen = set(queue)
